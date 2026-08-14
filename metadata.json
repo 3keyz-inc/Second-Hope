@@ -1,0 +1,8 @@
+{
+  "name": "OmniHealth Clinical Intelligence Portal",
+  "description": "Global clinical intelligence engine for breakthrough treatment discovery, clinical trial tracking, biomarker analysis, and personalized health optimization.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
