@@ -7,6 +7,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 let aiClient: GoogleGenAI | null = null;
+const SESSION_TOKENS = new Map<string, { userId: string; role: "user" | "admin"; expiresAt: number }>();
 
 function getAIClient(): GoogleGenAI {
   if (!aiClient) {
@@ -18,6 +19,52 @@ function getAIClient(): GoogleGenAI {
     aiClient = new GoogleGenAI({ apiKey: key });
   }
   return aiClient;
+}
+
+function createSessionToken(user: DbUser): string {
+  const token = `omni_${user.id}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+  SESSION_TOKENS.set(token, {
+    userId: user.id,
+    role: user.role,
+    expiresAt: Date.now() + 1000 * 60 * 60 * 8,
+  });
+  return token;
+}
+
+function getSessionFromRequest(req: Request) {
+  const authHeader = req.headers.authorization || "";
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  const token = match ? match[1] : null;
+
+  if (!token) return null;
+
+  const session = SESSION_TOKENS.get(token);
+  if (!session) return null;
+
+  if (session.expiresAt < Date.now()) {
+    SESSION_TOKENS.delete(token);
+    return null;
+  }
+
+  return session;
+}
+
+function requireAuth(req: Request, res: Response, next: NextFunction) {
+  const session = getSessionFromRequest(req);
+  if (!session) {
+    return res.status(401).json({ error: "Authentication required" });
+  }
+  (req as any).session = session;
+  next();
+}
+
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  const session = getSessionFromRequest(req);
+  if (!session || session.role !== "admin") {
+    return res.status(403).json({ error: "Admin access required" });
+  }
+  (req as any).session = session;
+  next();
 }
 
 // In-Memory Database for Production / Demo with Seed Data
@@ -191,52 +238,31 @@ async function startServer() {
 
   app.use(express.json({ limit: "25mb" }));
 
-  // Global request counter
   app.use((_req, _res, next) => {
     totalApiRequests++;
     next();
   });
 
-  // ==========================================
-  // AUTHENTICATION & USER ROUTES
-  // ==========================================
-
-  // 1. Google OAuth One-Click Endpoint
   app.post("/api/auth/google", (req: Request, res: Response) => {
     try {
-      const { email = "user@example.com", name = "Research Scholar", avatar, role = "user" } = req.body;
-      
-      let user = USERS_DB.find(u => u.email.toLowerCase() === email.toLowerCase());
-      
-      if (!user) {
-        user = {
-          id: `usr_${Date.now()}`,
-          name: name || "Verified Researcher",
-          email: email.toLowerCase(),
-          role: role === "admin" ? "admin" : "user",
-          avatar: avatar || `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name || email)}`,
-          status: "active",
-          bio: "Registered via Google One-Click OAuth.",
-          primaryGoal: "Clinical Research & Biomarker Tracking",
-          lastLogin: new Date().toISOString(),
-          createdAt: new Date().toISOString(),
-          savedTrialIds: [],
-          savedBiomarkerIds: []
-        };
-        USERS_DB.push(user);
-        logAudit(user.name, user.email, "USER_REGISTER_GOOGLE", "Auth Gateway", "success", "New user created via Google One-Click");
-      } else {
-        user.lastLogin = new Date().toISOString();
-        if (role && (role === "admin" || role === "user")) {
-          // Allow toggle in demo mode
-          user.role = role;
-        }
-        logAudit(user.name, user.email, "AUTH_LOGIN_GOOGLE", "Auth Gateway", "success", "Google One-Click Login");
+      const { email, name = "Research Scholar", avatar } = req.body;
+      const normalizedEmail = typeof email === "string" ? email.trim().toLowerCase() : "";
+
+      if (!normalizedEmail) {
+        return res.status(400).json({ error: "Email is required" });
       }
 
-      const mockToken = `jwt_token_${user.id}_${Date.now()}`;
+      const user = USERS_DB.find(u => u.email.toLowerCase() === normalizedEmail);
+      if (!user) {
+        return res.status(401).json({ error: "Account not found. Please register before continuing." });
+      }
+
+      user.lastLogin = new Date().toISOString();
+      logAudit(user.name, user.email, "AUTH_LOGIN_GOOGLE", "Auth Gateway", "success", "Google login accepted");
+
+      const token = createSessionToken(user);
       res.json({
-        token: mockToken,
+        token,
         user: {
           id: user.id,
           name: user.name,
@@ -257,24 +283,24 @@ async function startServer() {
     }
   });
 
-  // 2. Standard Email/Password Register
   app.post("/api/auth/register", (req: Request, res: Response) => {
     try {
-      const { name, email, password, role = "user" } = req.body;
+      const { name, email, password } = req.body;
       if (!name || !email || !password) {
         return res.status(400).json({ error: "Name, email, and password are required" });
       }
 
-      if (USERS_DB.some(u => u.email.toLowerCase() === email.toLowerCase())) {
+      const normalizedEmail = String(email).trim().toLowerCase();
+      if (USERS_DB.some(u => u.email.toLowerCase() === normalizedEmail)) {
         return res.status(400).json({ error: "Email address is already registered" });
       }
 
       const newUser: DbUser = {
         id: `usr_${Date.now()}`,
-        name,
-        email: email.toLowerCase(),
-        role: role === "admin" ? "admin" : "user",
-        avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(name)}`,
+        name: String(name),
+        email: normalizedEmail,
+        role: "user",
+        avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(String(name))}`,
         status: "active",
         bio: "Member of OmniHealth Research Network.",
         primaryGoal: "Biomarker and clinical protocol exploration",
@@ -287,39 +313,24 @@ async function startServer() {
       USERS_DB.push(newUser);
       logAudit(newUser.name, newUser.email, "USER_REGISTER_PASSWORD", "Auth Gateway", "success", "Created new account");
 
-      const token = `jwt_token_${newUser.id}_${Date.now()}`;
+      const token = createSessionToken(newUser);
       res.status(201).json({ token, user: newUser });
     } catch (err: any) {
       res.status(500).json({ error: "Registration failed" });
     }
   });
 
-  // 3. Standard Login
   app.post("/api/auth/login", (req: Request, res: Response) => {
     try {
-      const { email, password, role } = req.body;
+      const { email, password } = req.body;
       if (!email || !password) {
         return res.status(400).json({ error: "Email and password are required" });
       }
 
-      let user = USERS_DB.find(u => u.email.toLowerCase() === email.toLowerCase());
+      const normalizedEmail = String(email).trim().toLowerCase();
+      const user = USERS_DB.find(u => u.email.toLowerCase() === normalizedEmail);
       if (!user) {
-        // Create demo account automatically if not found for seamless testing
-        user = {
-          id: `usr_${Date.now()}`,
-          name: email.split("@")[0].toUpperCase(),
-          email: email.toLowerCase(),
-          role: role || (email.includes("admin") ? "admin" : "user"),
-          avatar: `https://api.dicebear.com/7.x/initials/svg?seed=${encodeURIComponent(email)}`,
-          status: "active",
-          bio: "OmniHealth platform user.",
-          primaryGoal: "Clinical Trials & Health Telemetry",
-          lastLogin: new Date().toISOString(),
-          createdAt: new Date().toISOString(),
-          savedTrialIds: [],
-          savedBiomarkerIds: []
-        };
-        USERS_DB.push(user);
+        return res.status(401).json({ error: "Account not found. Please register before continuing." });
       }
 
       if (user.status === "suspended") {
@@ -327,26 +338,26 @@ async function startServer() {
       }
 
       user.lastLogin = new Date().toISOString();
-      if (role && (role === "admin" || role === "user")) {
-        user.role = role;
-      }
-
       logAudit(user.name, user.email, "AUTH_LOGIN_SUCCESS", "Auth Gateway", "success", `Logged in with role: ${user.role}`);
 
-      const token = `jwt_token_${user.id}_${Date.now()}`;
+      const token = createSessionToken(user);
       res.json({ token, user });
     } catch (err: any) {
       res.status(500).json({ error: "Login failed" });
     }
   });
 
-  // 4. Update Profile
-  app.put("/api/users/profile", (req: Request, res: Response) => {
+  app.put("/api/users/profile", requireAuth, (req: Request, res: Response) => {
     try {
+      const session = (req as any).session as { userId: string; role: "user" | "admin" };
       const { userId, name, bio, primaryGoal, avatar } = req.body;
       const user = USERS_DB.find(u => u.id === userId);
       if (!user) {
         return res.status(404).json({ error: "User not found" });
+      }
+
+      if (user.id !== session.userId && session.role !== "admin") {
+        return res.status(403).json({ error: "Forbidden" });
       }
 
       if (name) user.name = name;
@@ -361,12 +372,16 @@ async function startServer() {
     }
   });
 
-  // 5. User Bookmarks (Trials & Biomarkers)
-  app.post("/api/users/save-item", (req: Request, res: Response) => {
+  app.post("/api/users/save-item", requireAuth, (req: Request, res: Response) => {
     try {
+      const session = (req as any).session as { userId: string; role: "user" | "admin" };
       const { userId, itemId, type } = req.body;
       const user = USERS_DB.find(u => u.id === userId);
       if (!user) return res.status(404).json({ error: "User not found" });
+
+      if (user.id !== session.userId && session.role !== "admin") {
+        return res.status(403).json({ error: "Forbidden" });
+      }
 
       if (type === "trial") {
         if (user.savedTrialIds.includes(itemId)) {
@@ -388,12 +403,7 @@ async function startServer() {
     }
   });
 
-  // ==========================================
-  // ADMIN CONTROL PANEL ROUTES (Role Protected)
-  // ==========================================
-
-  // Admin Stats
-  app.get("/api/admin/stats", (_req: Request, res: Response) => {
+  app.get("/api/admin/stats", requireAuth, requireAdmin, (_req: Request, res: Response) => {
     res.json({
       totalUsers: USERS_DB.length,
       activeToday: USERS_DB.filter(u => u.status === "active").length,
@@ -406,13 +416,11 @@ async function startServer() {
     });
   });
 
-  // Admin Users List
-  app.get("/api/admin/users", (_req: Request, res: Response) => {
+  app.get("/api/admin/users", requireAuth, requireAdmin, (_req: Request, res: Response) => {
     res.json({ users: USERS_DB });
   });
 
-  // Admin Update Role
-  app.patch("/api/admin/users/:id/role", (req: Request, res: Response) => {
+  app.patch("/api/admin/users/:id/role", requireAuth, requireAdmin, (req: Request, res: Response) => {
     const { id } = req.params;
     const { role } = req.body;
     const user = USERS_DB.find(u => u.id === id);
@@ -423,8 +431,7 @@ async function startServer() {
     res.json({ user });
   });
 
-  // Admin Update Status (Suspend/Activate)
-  app.patch("/api/admin/users/:id/status", (req: Request, res: Response) => {
+  app.patch("/api/admin/users/:id/status", requireAuth, requireAdmin, (req: Request, res: Response) => {
     const { id } = req.params;
     const { status } = req.body;
     const user = USERS_DB.find(u => u.id === id);
@@ -435,8 +442,7 @@ async function startServer() {
     res.json({ user });
   });
 
-  // Admin Delete User
-  app.delete("/api/admin/users/:id", (req: Request, res: Response) => {
+  app.delete("/api/admin/users/:id", requireAuth, requireAdmin, (req: Request, res: Response) => {
     const { id } = req.params;
     const idx = USERS_DB.findIndex(u => u.id === id);
     if (idx === -1) return res.status(404).json({ error: "User not found" });
@@ -446,24 +452,21 @@ async function startServer() {
     res.json({ success: true, deletedUser: deleted });
   });
 
-  // Admin Audit Logs
-  app.get("/api/admin/logs", (_req: Request, res: Response) => {
+  app.get("/api/admin/logs", requireAuth, requireAdmin, (_req: Request, res: Response) => {
     res.json({ logs: AUDIT_LOGS_DB });
   });
 
-  // Admin System Settings
-  app.get("/api/admin/settings", (_req: Request, res: Response) => {
+  app.get("/api/admin/settings", requireAuth, requireAdmin, (_req: Request, res: Response) => {
     res.json({ settings: SYSTEM_SETTINGS });
   });
 
-  app.post("/api/admin/settings", (req: Request, res: Response) => {
+  app.post("/api/admin/settings", requireAuth, requireAdmin, (req: Request, res: Response) => {
     SYSTEM_SETTINGS = { ...SYSTEM_SETTINGS, ...req.body };
     logAudit("Super Admin", "admin@omnihealth.io", "ADMIN_SETTINGS_UPDATED", "System Config", "success", "Updated system flags and parameters");
     res.json({ settings: SYSTEM_SETTINGS });
   });
 
-  // Admin Server Telemetry
-  app.get("/api/admin/server-health", (_req: Request, res: Response) => {
+  app.get("/api/admin/server-health", requireAuth, requireAdmin, (_req: Request, res: Response) => {
     const uptimeSeconds = Math.floor((Date.now() - serverStartTime) / 1000);
     const mem = process.memoryUsage();
     res.json({
@@ -478,8 +481,7 @@ async function startServer() {
     });
   });
 
-  // Database Seed Endpoint
-  app.post("/api/seed", (_req: Request, res: Response) => {
+  app.post("/api/seed", requireAuth, requireAdmin, (_req: Request, res: Response) => {
     logAudit("System Initializer", "system@omnihealth.io", "DATABASE_SEEDED", "Global DB", "success", "Seeded default users, trials, and metrics");
     res.json({
       message: "OmniHealth database successfully seeded with initial administrative and test records.",
@@ -488,17 +490,11 @@ async function startServer() {
     });
   });
 
-  // ==========================================
-  // CLINICAL & AI RESEARCH APIS
-  // ==========================================
-
-  // Health check route
   app.get("/api/health", (_req, res) => {
     res.json({ status: "ok", timestamp: new Date().toISOString() });
   });
 
-  // AI Chat Route
-  app.post("/api/chat", async (req, res) => {
+  app.post("/api/chat", requireAuth, async (req, res) => {
     try {
       const { message, persona = "specialist", language = "English", history = [] } = req.body;
       if (!message) {
@@ -506,15 +502,14 @@ async function startServer() {
       }
 
       const ai = getAIClient();
-      
       let systemInstruction = "You are an expert, compassionate clinical intelligence and medical research assistant on the OmniHealth portal. ";
-      
+
       if (persona === "specialist") {
-        systemInstruction += "You specialize in clinical research, oncology, pharmacology, immunology, and evidence-based therapeutic breakthroughs. Provide structured, precise scientific explanations with clear context and PubMed-grade reasoning.";
+        systemInstruction += "You specialize in clinical research, oncology, pharmacology, immunology, and evidence-based therapeutic breakthroughs. Provide structured, precise scientific explanations with prudent caveats.";
       } else if (persona === "vitality") {
-        systemInstruction += "You specialize in metabolic optimization, sleep architecture, anti-inflammatory nutrition, stress modulation, and daily vitality habits. Provide highly practical, encouraging, step-by-step lifestyle guidance.";
+        systemInstruction += "You specialize in metabolic optimization, sleep architecture, anti-inflammatory nutrition, stress modulation, and daily vitality habits. Provide highly practical, evidence-based guidance.";
       } else {
-        systemInstruction += "You are a friendly, compassionate Patient Advocate. Translate complex medical terms into clear, comforting, easy-to-understand plain language. Help patients prepare thoughtful questions for their doctors.";
+        systemInstruction += "You are a friendly, compassionate Patient Advocate. Translate complex medical terms into clear, comforting, easy-to-understand plain language.";
       }
 
       systemInstruction += ` You MUST respond in ${language}. Always maintain a respectful, evidence-based tone and include appropriate clinical guidance disclaimers when discussing treatments.`;
@@ -550,15 +545,14 @@ async function startServer() {
       res.json({ reply: replyText });
     } catch (error: any) {
       console.error("Chat API error:", error);
-      res.status(500).json({ 
+      res.status(500).json({
         error: error.message || "Failed to generate AI response",
         fallback: "Our AI research service is currently processing high volume. Please check your internet connection or try again."
       });
     }
   });
 
-  // Biomarker / Lab analyzer route
-  app.post("/api/analyze-biomarker", async (req, res) => {
+  app.post("/api/analyze-biomarker", requireAuth, async (req, res) => {
     try {
       const { biomarkerName, value, unit, context = "", language = "English" } = req.body;
       if (!biomarkerName) {
@@ -593,13 +587,12 @@ Respond with clean markdown formatting. Keep the tone professional, objective, a
     }
   });
 
-  // Clinical Trial / Research Summarizer
-  app.post("/api/summarize-trial", async (req, res) => {
+  app.post("/api/summarize-trial", requireAuth, async (req, res) => {
     try {
       const { title, phase, condition, description, audience = "patient", language = "English" } = req.body;
       const ai = getAIClient();
 
-      const audienceInstruction = audience === "patient" 
+      const audienceInstruction = audience === "patient"
         ? "Explain this in clear, compassionate, jargon-free plain English for a patient or caregiver."
         : "Provide a rigorous clinical summary highlighting mechanism of action, inclusion criteria, and primary endpoints for a medical researcher.";
 
@@ -631,7 +624,6 @@ Include:
     }
   });
 
-  // Vite middleware setup
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -646,8 +638,8 @@ Include:
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`OmniHealth Full-Stack Engine running on http://0.0.0.0:${PORT}`);
+  app.listen(PORT, "127.0.0.1", () => {
+    console.log(`OmniHealth Full-Stack Engine running on http://127.0.0.1:${PORT}`);
   });
 }
 
